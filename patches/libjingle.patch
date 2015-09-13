@@ -1,0 +1,270 @@
+Index: base/openssladapter.cc
+===================================================================
+--- base/openssladapter.cc	(revision 8849)
++++ base/openssladapter.cc	(working copy)
+@@ -274,6 +274,20 @@
+   return true;
+ }
+ 
++
++OpenSSLAdapter::OpenSSLAdapter(AsyncSocket* socket, OpenSSLIdentity* identity)
++  : SSLAdapter(socket),
++    state_(SSL_NONE),
++    ssl_read_needs_write_(false),
++    ssl_write_needs_read_(false),
++    restartable_(false),
++    ssl_(NULL), ssl_ctx_(NULL),
++    custom_verification_succeeded_(false),
++    identity_(identity) {
++}
++
++
++
+ OpenSSLAdapter::OpenSSLAdapter(AsyncSocket* socket)
+   : SSLAdapter(socket),
+     state_(SSL_NONE),
+@@ -281,7 +295,8 @@
+     ssl_write_needs_read_(false),
+     restartable_(false),
+     ssl_(NULL), ssl_ctx_(NULL),
+-    custom_verification_succeeded_(false) {
++    custom_verification_succeeded_(false),
++    identity_(NULL) {
+ }
+ 
+ OpenSSLAdapter::~OpenSSLAdapter() {
+@@ -327,6 +342,12 @@
+     goto ssl_error;
+   }
+ 
++  if (identity_) {
++    LOG(LS_INFO) << "Setting custom certificates";
++    SSL_CTX_use_certificate(ssl_ctx_, identity_->certificate().x509());
++    SSL_CTX_use_PrivateKey(ssl_ctx_, identity_->key_pair().pkey());
++  }
++
+   bio = BIO_new_socket(static_cast<AsyncSocketAdapter*>(socket_));
+   if (!bio) {
+     err = -1;
+Index: base/openssladapter.h
+===================================================================
+--- base/openssladapter.h	(revision 8849)
++++ base/openssladapter.h	(working copy)
+@@ -30,6 +30,7 @@
+ 
+ #include <string>
+ #include "talk/base/ssladapter.h"
++#include "talk/base/opensslidentity.h"
+ 
+ typedef struct ssl_st SSL;
+ typedef struct ssl_ctx_st SSL_CTX;
+@@ -46,6 +47,8 @@
+   static bool CleanupSSL();
+ 
+   OpenSSLAdapter(AsyncSocket* socket);
++  OpenSSLAdapter(AsyncSocket* socket, OpenSSLIdentity* identity);
++
+   virtual ~OpenSSLAdapter();
+ 
+   virtual int StartSSL(const char* hostname, bool restartable);
+@@ -94,6 +97,7 @@
+   SSL* ssl_;
+   SSL_CTX* ssl_ctx_;
+   std::string ssl_host_name_;
++  OpenSSLIdentity* identity_;
+ 
+   bool custom_verification_succeeded_;
+ };
+Index: base/opensslidentity.h
+===================================================================
+--- base/opensslidentity.h	(revision 8849)
++++ base/opensslidentity.h	(working copy)
+@@ -137,6 +137,10 @@
+     return *certificate_;
+   }
+ 
++  virtual const OpenSSLKeyPair& key_pair() const {
++    return *key_pair_;
++  }
++
+   virtual OpenSSLIdentity* GetReference() const {
+     return new OpenSSLIdentity(key_pair_->GetReference(),
+                                certificate_->GetReference());
+Index: base/ssladapter.cc
+===================================================================
+--- base/ssladapter.cc	(revision 8849)
++++ base/ssladapter.cc	(working copy)
+@@ -40,6 +40,7 @@
+ #elif SSL_USE_OPENSSL  // && !SSL_USE_SCHANNEL
+ 
+ #include "openssladapter.h"
++#include "opensslidentity.h"
+ 
+ #elif SSL_USE_NSS     // && !SSL_USE_CHANNEL && !SSL_USE_OPENSSL
+ 
+@@ -63,6 +64,22 @@
+ #endif  // !SSL_USE_OPENSSL && !SSL_USE_SCHANNEL
+ }
+ 
++
++SSLAdapter*
++SSLAdapter::Create(AsyncSocket* socket, SSLIdentity* identity) {
++#if SSL_USE_SCHANNEL
++  // Identity is not set and only default adapter is created
++  return new SChannelAdapter(socket);
++#elif SSL_USE_OPENSSL  // && !SSL_USE_SCHANNEL
++  return new OpenSSLAdapter(socket, static_cast<OpenSSLIdentity*>(identity));
++#else  // !SSL_USE_OPENSSL && !SSL_USE_SCHANNEL
++  delete socket;
++  return NULL;
++#endif  // !SSL_USE_OPENSSL && !SSL_USE_SCHANNEL
++}
++
++
++
+ ///////////////////////////////////////////////////////////////////////////////
+ 
+ #if SSL_USE_OPENSSL
+Index: base/ssladapter.h
+===================================================================
+--- base/ssladapter.h	(revision 8849)
++++ base/ssladapter.h	(working copy)
+@@ -29,6 +29,7 @@
+ #define TALK_BASE_SSLADAPTER_H_
+ 
+ #include "talk/base/asyncsocket.h"
++#include "talk/base/sslidentity.h"
+ 
+ namespace talk_base {
+ 
+@@ -52,6 +53,12 @@
+   // of |socket|.
+   static SSLAdapter* Create(AsyncSocket* socket);
+ 
++  // Create the default SSL adapter for this platform with provided X.509 
++  // certificate and Private key in the form of sslidentity. On failure, returns
++  // NULL and deletes |socket|. Otherwise, the returned SSLAdapter takes 
++  // ownership of |socket|.
++  static SSLAdapter* Create(AsyncSocket* socket, SSLIdentity* identity);
++ 
+  private:
+   // If true, the server certificate need not match the configured hostname.
+   bool ignore_bad_cert_;
+Index: libjingle.gyp
+===================================================================
+--- libjingle.gyp	(revision 8849)
++++ libjingle.gyp	(working copy)
+@@ -991,7 +991,7 @@
+       'dependencies': [
+         '<(DEPTH)/third_party/libsrtp/libsrtp.gyp:libsrtp',
+         'libjingle',
+-        'libjingle_media',
++        #'libjingle_media',
+       ],
+       'include_dirs': [
+         '<(DEPTH)/testing/gtest/include',
+@@ -1131,7 +1131,7 @@
+       'type': 'static_library',
+       'dependencies': [
+         'libjingle',
+-        'libjingle_media',
++        #'libjingle_media',
+         'libjingle_p2p',
+       ],
+       'sources': [
+Index: xmpp/constants.cc
+===================================================================
+--- xmpp/constants.cc	(revision 8849)
++++ xmpp/constants.cc	(working copy)
+@@ -626,5 +626,6 @@
+ const char AUTH_MECHANISM_GOOGLE_TOKEN[] = "X-GOOGLE-TOKEN";
+ const char AUTH_MECHANISM_OAUTH2[] = "X-OAUTH2";
+ const char AUTH_MECHANISM_PLAIN[] = "PLAIN";
++const char AUTH_MECHANISM_EXTERNAL[] = "EXTERNAL";
+ 
+ }  // namespace buzz
+Index: xmpp/constants.h
+===================================================================
+--- xmpp/constants.h	(revision 8849)
++++ xmpp/constants.h	(working copy)
+@@ -561,6 +561,7 @@
+ extern const char AUTH_MECHANISM_GOOGLE_TOKEN[];
+ extern const char AUTH_MECHANISM_OAUTH2[];
+ extern const char AUTH_MECHANISM_PLAIN[];
++extern const char AUTH_MECHANISM_EXTERNAL[];
+ 
+ }  // namespace buzz
+ 
+Index: xmpp/xmppauth.cc
+===================================================================
+--- xmpp/xmppauth.cc	(revision 8849)
++++ xmpp/xmppauth.cc	(working copy)
+@@ -32,6 +32,7 @@
+ #include "talk/xmpp/constants.h"
+ #include "talk/xmpp/saslcookiemechanism.h"
+ #include "talk/xmpp/saslplainmechanism.h"
++#include "talk/xmpp/saslexternalmechanism.h"
+ 
+ XmppAuth::XmppAuth() : done_(false) {
+ }
+@@ -79,6 +80,12 @@
+     return buzz::AUTH_MECHANISM_GOOGLE_COOKIE;
+   }
+ 
++
++  // try PKIX, before PLAIN
++  if (contains(mechanisms, buzz::AUTH_MECHANISM_EXTERNAL)) {
++    return buzz::AUTH_MECHANISM_EXTERNAL;
++  }
++
+   // As a last resort, use plain authentication.
+   if (contains(mechanisms, buzz::AUTH_MECHANISM_PLAIN)) {
+     return buzz::AUTH_MECHANISM_PLAIN;
+@@ -97,6 +104,8 @@
+     return new buzz::SaslCookieMechanism(mechanism, jid_.Str(), auth_token_);
+   // } else if (mechanism == buzz::AUTH_MECHANISM_GOOGLE_COOKIE) {
+   //   return new buzz::SaslCookieMechanism(mechanism, jid.Str(), sid_);
++  } else if (mechanism == buzz::AUTH_MECHANISM_EXTERNAL) {
++    return new buzz::SaslExternalMechanism(jid_);
+   } else if (mechanism == buzz::AUTH_MECHANISM_PLAIN) {
+     return new buzz::SaslPlainMechanism(jid_, passwd_);
+   } else {
+Index: xmpp/xmppclient.cc
+===================================================================
+--- xmpp/xmppclient.cc	(revision 8849)
++++ xmpp/xmppclient.cc	(working copy)
+@@ -35,6 +35,7 @@
+ #include "talk/xmpp/saslplainmechanism.h"
+ #include "talk/xmpp/prexmppauth.h"
+ #include "talk/xmpp/plainsaslhandler.h"
++#include "talk/xmpp/externalsaslhandler.h"
+ 
+ namespace buzz {
+ 
+@@ -228,6 +229,12 @@
+     d_->pass_.Clear(); // done with this;
+     return STATE_PRE_XMPP_LOGIN;
+   }
++  else if (d_->auth_mechanism_ == "EXTERNAL") {
++    d_->engine_->SetSaslHandler(new ExternalSaslHandler(
++              d_->engine_->GetUser()));
++    d_->pass_.Clear(); // done with this;
++    return STATE_START_XMPP_LOGIN;
++  }
+   else {
+     d_->engine_->SetSaslHandler(new PlainSaslHandler(
+               d_->engine_->GetUser(), d_->pass_, d_->allow_plain_));
+Index: xmpp/xmppclientsettings.h
+===================================================================
+--- xmpp/xmppclientsettings.h	(revision 8849)
++++ xmpp/xmppclientsettings.h	(working copy)
+@@ -44,6 +44,9 @@
+   void set_user(const std::string& user) { user_ = user; }
+   void set_host(const std::string& host) { host_ = host; }
+   void set_pass(const talk_base::CryptString& pass) { pass_ = pass; }
++  void set_auth_mechanism(const std::string& mechanism) {
++    auth_mechanism_ = mechanism;
++  }
+   void set_auth_token(const std::string& mechanism,
+                       const std::string& token) {
+     auth_mechanism_ = mechanism;

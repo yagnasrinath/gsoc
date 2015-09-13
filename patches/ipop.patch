@@ -1,0 +1,183 @@
+diff --git a/src/controlleraccess.cc b/src/controlleraccess.cc
+index 3fc1575..00d5b79 100644
+--- a/src/controlleraccess.cc
++++ b/src/controlleraccess.cc
+@@ -28,6 +28,10 @@
+ #include "talk/base/json.h"
+ #include "controlleraccess.h"
+ #include "tincan_utils.h"
++#include "talk/base/sslidentity.h"
++#include <fstream>
++#include <sstream>
++#include <iostream>
+ 
+ namespace tincan {
+ 
+@@ -195,7 +199,33 @@ void ControllerAccess::HandlePacket(talk_base::AsyncPacketSocket* socket,
+         std::string user = root["username"].asString();
+         std::string pass = root["password"].asString();
+         std::string host = root["host"].asString();
+-        bool res = network_.Login(user, pass, manager_.uid(), host);
++        std::string x509_path = root["x509"].asString();
++        std::string pkey_path = root["pkey"].asString();
++        talk_base::SSLIdentity* identity = NULL;
++        if(x509_path!="" && pkey_path!="")
++        {
++          string pem_key, pem_cert;
++
++          std::ifstream in_cert(x509_path.c_str(), std::ios::in | std::ios::binary);
++          if (in_cert)
++          {
++            std::ostringstream contents;
++            contents << in_cert.rdbuf();
++            in_cert.close();
++            pem_cert = contents.str();
++          }
++
++          std::ifstream in_key(pkey_path.c_str(), std::ios::in | std::ios::binary);
++          if (in_key)
++          {
++            std::ostringstream contents;
++            contents << in_key.rdbuf();
++            in_key.close();
++            pem_key = contents.str();
++          }
++          identity = talk_base::SSLIdentity::FromPEMStrings(pem_key, pem_cert);
++        }
++        bool res = network_.Login(user, pass, manager_.uid(), host, identity);
+       }
+       break;
+     case CREATE_LINK: {
+diff --git a/src/tincanxmppsocket.cc b/src/tincanxmppsocket.cc
+index ec85fc7..8f1e609 100644
+--- a/src/tincanxmppsocket.cc
++++ b/src/tincanxmppsocket.cc
+@@ -43,10 +43,15 @@
+ namespace tincan {
+ 
+ TinCanXmppSocket::TinCanXmppSocket(buzz::TlsOptions tls) : cricket_socket_(NULL),
+-                                               tls_(tls) {
++                                               tls_(tls), identity_(NULL) {
+   state_ = buzz::AsyncSocket::STATE_CLOSED;
+ }
+ 
++
++void TinCanXmppSocket::SetIdentity(talk_base::SSLIdentity* identity) {
++  identity_=identity;
++}
++
+ void TinCanXmppSocket::CreateCricketSocket(int family) {
+   talk_base::Thread* pth = talk_base::Thread::Current();
+   if (family == AF_UNSPEC) {
+@@ -59,7 +64,7 @@ void TinCanXmppSocket::CreateCricketSocket(int family) {
+ #ifdef WIN32
+     socket = new talk_base::SChannelAdapter(socket);
+ #else
+-    socket = talk_base::SSLAdapter::Create(socket);
++    socket = talk_base::SSLAdapter::Create(socket,identity_);
+ #endif
+   }
+ #endif  // FEATURE_ENABLE_SSL
+diff --git a/src/tincanxmppsocket.h b/src/tincanxmppsocket.h
+index 853eb0e..667df7c 100644
+--- a/src/tincanxmppsocket.h
++++ b/src/tincanxmppsocket.h
+@@ -31,6 +31,7 @@
+ #include "talk/base/asyncsocket.h"
+ #include "talk/base/bytebuffer.h"
+ #include "talk/base/sigslot.h"
++#include "talk/base/sslidentity.h"
+ #include "talk/xmpp/asyncsocket.h"
+ #include "talk/xmpp/xmppengine.h"
+ 
+@@ -60,6 +61,7 @@ public:
+   virtual bool Write(const char * data, size_t len);
+   virtual bool Close();
+   virtual bool StartTls(const std::string & domainname);
++  virtual void SetIdentity(talk_base::SSLIdentity* identity);
+ 
+   sigslot::signal1<int> SignalCloseEvent;
+ 
+@@ -74,6 +76,7 @@ private:
+   buzz::AsyncSocket::State state_;
+   talk_base::ByteBuffer buffer_;
+   buzz::TlsOptions tls_;
++  talk_base::SSLIdentity* identity_;
+ };
+ 
+ }  // namespace buzz
+diff --git a/src/xmppnetwork.cc b/src/xmppnetwork.cc
+index 943dafc..8b5cd62 100644
+--- a/src/xmppnetwork.cc
++++ b/src/xmppnetwork.cc
+@@ -145,9 +145,10 @@ bool TinCanTask::HandleStanza(const buzz::XmlElement* stanza) {
+ }
+ 
+ bool XmppNetwork::Login(std::string username, std::string password,
+-                        std::string pcid, std::string host) {
+-  if (pump_.get() || username.empty() || password.empty() || 
+-      pcid.empty() || host.empty()) return false;
++                        std::string pcid, std::string host, 
++                        talk_base::SSLIdentity* identity = NULL) {
++  if (pump_.get() || username.empty() || (password.empty() && !identity)
++      || pcid.empty() || host.empty()) return false;
+ 
+   talk_base::InsecureCryptStringImpl pass;
+   pass.password() = password;
+@@ -158,6 +159,10 @@ bool XmppNetwork::Login(std::string username, std::string password,
+   xcs_.set_host(jid.domain());
+   xcs_.set_resource(resource);
+   xcs_.set_use_tls(buzz::TLS_REQUIRED);
++  if (identity) {
++    xcs_.set_auth_mechanism("EXTERNAL");
++    identity_=identity;
++  }
+   //xcs_.set_allow_plain(true);
+   xcs_.set_pass(talk_base::CryptString(pass));
+   xcs_.set_server(talk_base::SocketAddress(host, kXmppPort));
+@@ -166,6 +171,7 @@ bool XmppNetwork::Login(std::string username, std::string password,
+ 
+ bool XmppNetwork::Connect() {
+   xmpp_socket_.reset(new TinCanXmppSocket(buzz::TLS_REQUIRED));
++  xmpp_socket_->SetIdentity(identity_);
+   xmpp_socket_->SignalCloseEvent.connect(this, &XmppNetwork::OnCloseEvent);
+ 
+   pump_.reset(new buzz::XmppPump());
+diff --git a/src/xmppnetwork.h b/src/xmppnetwork.h
+index 8234bf0..19da04f 100644
+--- a/src/xmppnetwork.h
++++ b/src/xmppnetwork.h
+@@ -38,6 +38,7 @@
+ #include "talk/xmpp/xmppclient.h"
+ #include "talk/xmpp/xmpppump.h"
+ #include "talk/base/logging.h"
++#include "talk/base/sslidentity.h"
+ 
+ #include "tincanxmppsocket.h"
+ #include "peersignalsender.h"
+@@ -79,7 +80,7 @@ class XmppNetwork
+       public sigslot::has_slots<> {
+  public:
+   explicit XmppNetwork(talk_base::Thread* main_thread) 
+-      : main_thread_(main_thread){};
++      : main_thread_(main_thread), identity_(NULL){};
+ 
+   // Slot for message callbacks
+   sigslot::signal3<const std::string&, const std::string&,
+@@ -118,7 +119,7 @@ class XmppNetwork
+   virtual void OnMessage(talk_base::Message* msg);
+ 
+   bool Login(std::string username, std::string password,
+-             std::string pcid, std::string host);
++             std::string pcid, std::string host, talk_base::SSLIdentity* identity);
+ 
+  private:
+   bool Connect();
+@@ -139,6 +140,7 @@ class XmppNetwork
+   buzz::XmppEngine::State xmpp_state_;
+   int on_msg_counter_;
+   std::string uid_;
++  talk_base::SSLIdentity* identity_;
+ 
+ };
+ 

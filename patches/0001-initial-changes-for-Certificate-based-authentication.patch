@@ -1,0 +1,126 @@
+From 27d90df30c729ccb080e52b00b93e584a5292277 Mon Sep 17 00:00:00 2001
+From: srinath <srinathreddib@gmail.com>
+Date: Thu, 2 Jul 2015 20:09:24 -0400
+Subject: [PATCH] initial changes for Certificate based authentication
+
+---
+ src/gvpn_controller.py |  9 ++++++---
+ src/ipoplib.py         | 15 +++++++++++----
+ src/svpn_controller.py |  9 +++++----
+ 3 files changed, 22 insertions(+), 11 deletions(-)
+
+diff --git a/src/gvpn_controller.py b/src/gvpn_controller.py
+index cc82707..31dfcba 100755
+--- a/src/gvpn_controller.py
++++ b/src/gvpn_controller.py
+@@ -3,11 +3,13 @@
+ from ipoplib import *
+ 
+ class GvpnUdpServer(UdpServer):
+-    def __init__(self, user, password, host, ip4):
+-        UdpServer.__init__(self, user, password, host, ip4)
++    def __init__(self, user, password, host, ip4, x509="", pkey=""):
++        UdpServer.__init__(self, user, password, host, ip4, x509="", pkey="")
+         self.idle_peers = {}
+         self.user = user
+         self.password = password
++        self.x509 = x509
++        self.pkey = pkey
+         self.host = host
+         self.ip4 = ip4
+         self.uid = gen_uid(ip4)
+@@ -48,7 +50,8 @@ class GvpnUdpServer(UdpServer):
+                            gen_ip6(self.uid), CONFIG["router_ip4_mask"],
+                            CONFIG["router_ip6_mask"], CONFIG["subnet_mask"])
+ 
+-        do_register_service(self.sock, self.user, self.password, self.host)
++        do_register_service(self.sock, self.user, self.password, self.host,
++                           self.x509, self.pkey)
+         do_set_switchmode(self.sock, CONFIG["switchmode"])
+         do_set_trimpolicy(self.sock, CONFIG["trim_enabled"])
+         do_get_state(self.sock)
+diff --git a/src/ipoplib.py b/src/ipoplib.py
+index a8bbb2a..7ce015a 100755
+--- a/src/ipoplib.py
++++ b/src/ipoplib.py
+@@ -57,7 +57,9 @@ CONFIG = {
+     "multihop_sr": True, # Multihop source route
+     "stat_report": False,
+     "stat_server" : "metrics.ipop-project.org",
+-    "stat_server_port" : 5000
++    "stat_server_port" : 5000,
++	"x509" : "",
++	"pkey" : ""
+ }
+ 
+ IP_MAP = {}
+@@ -171,6 +173,7 @@ def gen_uid(ip4):
+ def make_call(sock, payload=None, **params):
+     if socket.has_ipv6: dest = (CONFIG["localhost6"], CONFIG["svpn_port"])
+     else: dest = (CONFIG["localhost"], CONFIG["svpn_port"])
++    print(json.dumps(params))
+     if payload == None:
+         return sock.sendto(ipop_ver + tincan_control + json.dumps(params), dest)
+     else:
+@@ -217,9 +220,13 @@ def do_send_msg(sock, method, overlay_id, uid, data):
+ def do_set_cb_endpoint(sock, addr):
+     return make_call(sock, m="set_cb_endpoint", ip=addr[0], port=addr[1])
+ 
+-def do_register_service(sock, username, password, host):
+-    return make_call(sock, m="register_svc", username=username,
++def do_register_service(sock, username, password, host, x509="", pkey=""):
++    if x509 == "" or pkey == "" or x509 == None or pkey == None:
++        return make_call(sock, m="register_svc", username=username,
+                      password=password, host=host)
++    else:
++        return make_call(sock, m="register_svc", username=username,
++                     password=password, host=host, x509=x509, pkey=pkey)
+ 
+ def do_create_link(sock, uid, fpr, overlay_id, sec, cas, stun=None, turn=None):
+     if stun is None:
+@@ -266,7 +273,7 @@ def do_set_trimpolicy(sock, trim_enabled):
+     return make_call(sock, m="set_trimpolicy", trim_enabled=trim_enabled)
+ 
+ class UdpServer(object):
+-    def __init__(self, user, password, host, ip4):
++    def __init__(self, user, password, host, ip4, x509="", pkey=""):
+         self.ipop_state = {}
+         self.peers = {}
+         self.peers_ip4 = {}
+diff --git a/src/svpn_controller.py b/src/svpn_controller.py
+index b7bc3fe..ee80002 100755
+--- a/src/svpn_controller.py
++++ b/src/svpn_controller.py
+@@ -3,8 +3,8 @@
+ from ipoplib import *
+ 
+ class SvpnUdpServer(UdpServer):
+-    def __init__(self, user, password, host, ip4, uid):
+-        UdpServer.__init__(self, user, password, host, ip4)
++    def __init__(self, user, password, host, ip4, uid, x509="", pkey=""):
++        UdpServer.__init__(self, user, password, host, ip4, x509, pkey)
+         self.uid = uid
+         self.ip4 = ip4
+         self.ip6 = gen_ip6(uid)
+@@ -16,7 +16,7 @@ class SvpnUdpServer(UdpServer):
+         do_set_cb_endpoint(self.sock, self.sock.getsockname())
+         do_set_local_ip(self.sock, uid, ip4, gen_ip6(uid), CONFIG["ip4_mask"],
+                         CONFIG["ip6_mask"], CONFIG["subnet_mask"], 0)
+-        do_register_service(self.sock, user, password, host)
++        do_register_service(self.sock, user, password, host, x509, pkey)
+         do_set_trimpolicy(self.sock, CONFIG["trim_enabled"])
+         do_get_state(self.sock, stats=False)
+         if CONFIG["icc"]:
+@@ -163,7 +163,8 @@ class SvpnUdpServer(UdpServer):
+ def main():
+     parse_config()
+     server = SvpnUdpServer(CONFIG["xmpp_username"], CONFIG["xmpp_password"],
+-                       CONFIG["xmpp_host"], CONFIG["ip4"], CONFIG["local_uid"])
++                       CONFIG["xmpp_host"], CONFIG["ip4"], CONFIG["local_uid"],
++                       CONFIG["x509"], CONFIG["pkey"])
+     set_global_variable_server(server)
+     if CONFIG["stat_report"]:
+         server.report()
+-- 
+2.1.4
+
